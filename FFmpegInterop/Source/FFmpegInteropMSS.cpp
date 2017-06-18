@@ -60,6 +60,7 @@ FFmpegInteropMSS::FFmpegInteropMSS()
 
 FFmpegInteropMSS::~FFmpegInteropMSS()
 {
+	mutexGuard.lock();
 	if (mss)
 	{
 		mss->Starting -= startingRequestedToken;
@@ -88,6 +89,7 @@ FFmpegInteropMSS::~FFmpegInteropMSS()
 	{
 		fileStreamData->Release();
 	}
+	mutexGuard.unlock();
 }
 
 FFmpegInteropMSS^ FFmpegInteropMSS::CreateFFmpegInteropMSSFromStream(IRandomAccessStream^ stream, bool forceAudioDecode, bool forceVideoDecode, PropertySet^ ffmpegOptions)
@@ -327,6 +329,12 @@ HRESULT FFmpegInteropMSS::InitFFmpegContext(bool forceAudioDecode, bool forceVid
 								m_pReader->SetAudioStream(audioStreamIndex, audioSampleProvider);
 							}
 						}
+
+						if (SUCCEEDED(hr))
+						{
+							// Convert audio codec name for property
+							hr = ConvertCodecName(avAudioCodec->name, &audioCodecName);
+						}
 					}
 				}
 			}
@@ -349,6 +357,16 @@ HRESULT FFmpegInteropMSS::InitFFmpegContext(bool forceAudioDecode, bool forceVid
 			}
 			else
 			{
+				AVDictionaryEntry *rotate_tag = av_dict_get(avFormatCtx->streams[videoStreamIndex]->metadata, "rotate", NULL, 0);
+				if (rotate_tag != NULL)
+				{
+					rotateVideo = true;
+					rotationAngle = atoi(rotate_tag->value);
+				}
+				else
+				{
+					rotateVideo = false;
+				}
 				// allocate a new decoding context
 				avVideoCodecCtx = avcodec_alloc_context3(avVideoCodec);
 				if (!avVideoCodecCtx)
@@ -387,6 +405,12 @@ HRESULT FFmpegInteropMSS::InitFFmpegContext(bool forceAudioDecode, bool forceVid
 							{
 								m_pReader->SetVideoStream(videoStreamIndex, videoSampleProvider);
 							}
+						}
+
+						if (SUCCEEDED(hr))
+						{
+							// Convert video codec name for property
+							hr = ConvertCodecName(avVideoCodec->name, &videoCodecName);
 						}
 					}
 				}
@@ -439,6 +463,35 @@ HRESULT FFmpegInteropMSS::InitFFmpegContext(bool forceAudioDecode, bool forceVid
 	return hr;
 }
 
+HRESULT FFmpegInteropMSS::ConvertCodecName(const char* codecName, String^ *outputCodecName)
+{
+	HRESULT hr = S_OK;
+
+	// Convert codec name from const char* to Platform::String
+	auto codecNameChars = codecName;
+	size_t newsize = strlen(codecNameChars) + 1;
+	wchar_t * wcstring = nullptr;
+
+	try
+	{
+		wcstring = new wchar_t[newsize];
+	}
+	catch (std::bad_alloc&)
+	{
+		hr = E_FAIL; // couldn't allocate memory for codec name
+	}
+
+	if (SUCCEEDED(hr))
+	{
+		size_t convertedChars = 0;
+		mbstowcs_s(&convertedChars, wcstring, newsize, codecNameChars, _TRUNCATE);
+		*outputCodecName = ref new Platform::String(wcstring);
+		delete[] wcstring;
+	}
+
+	return hr;
+}
+
 HRESULT FFmpegInteropMSS::CreateAudioStreamDescriptor(bool forceAudioDecode)
 {
 	if (avAudioCodecCtx->codec_id == AV_CODEC_ID_AAC && !forceAudioDecode)
@@ -460,9 +513,8 @@ HRESULT FFmpegInteropMSS::CreateAudioStreamDescriptor(bool forceAudioDecode)
 	}
 	else
 	{
-		// Set default 16 bits when bits per sample value is unknown (0)
-		unsigned int bitsPerSample = avAudioCodecCtx->bits_per_coded_sample ? avAudioCodecCtx->bits_per_coded_sample : 16;
-		audioStreamDescriptor = ref new AudioStreamDescriptor(AudioEncodingProperties::CreatePcm(avAudioCodecCtx->sample_rate, avAudioCodecCtx->channels, bitsPerSample));
+		// We always convert to 16-bit audio so set the size here
+		audioStreamDescriptor = ref new AudioStreamDescriptor(AudioEncodingProperties::CreatePcm(avAudioCodecCtx->sample_rate, avAudioCodecCtx->channels, 16));
 		audioSampleProvider = ref new UncompressedAudioSampleProvider(m_pReader, avFormatCtx, avAudioCodecCtx);
 	}
 
@@ -501,7 +553,11 @@ HRESULT FFmpegInteropMSS::CreateVideoStreamDescriptor(bool forceVideoDecode)
 			videoProperties->PixelAspectRatio->Denominator = avVideoCodecCtx->sample_aspect_ratio.den;
 		}
 	}
-
+	if (rotateVideo)
+	{
+		Platform::Guid MF_MT_VIDEO_ROTATION(0xC380465D, 0x2271, 0x428C, 0x9B, 0x83, 0xEC, 0xEA, 0x3B, 0x4A, 0x85, 0xC1);
+		videoProperties->Properties->Insert(MF_MT_VIDEO_ROTATION, (uint32)rotationAngle);
+	}
 	// Detect the correct framerate
 	if (avVideoCodecCtx->framerate.num != 0 || avVideoCodecCtx->framerate.den != 1)
 	{
@@ -601,18 +657,23 @@ void FFmpegInteropMSS::OnStarting(MediaStreamSource ^sender, MediaStreamSourceSt
 
 void FFmpegInteropMSS::OnSampleRequested(Windows::Media::Core::MediaStreamSource ^sender, MediaStreamSourceSampleRequestedEventArgs ^args)
 {
-	if (args->Request->StreamDescriptor == audioStreamDescriptor && audioSampleProvider != nullptr)
+	mutexGuard.lock();
+	if (mss != nullptr)
 	{
-		args->Request->Sample = audioSampleProvider->GetNextSample();
+		if (args->Request->StreamDescriptor == audioStreamDescriptor && audioSampleProvider != nullptr)
+		{
+			args->Request->Sample = audioSampleProvider->GetNextSample();
+		}
+		else if (args->Request->StreamDescriptor == videoStreamDescriptor && videoSampleProvider != nullptr)
+		{
+			args->Request->Sample = videoSampleProvider->GetNextSample();
+		}
+		else
+		{
+			args->Request->Sample = nullptr;
+		}
 	}
-	else if (args->Request->StreamDescriptor == videoStreamDescriptor && videoSampleProvider != nullptr)
-	{
-		args->Request->Sample = videoSampleProvider->GetNextSample();
-	}
-	else
-	{
-		args->Request->Sample = nullptr;
-	}
+	mutexGuard.unlock();
 }
 
 // Static function to read file stream and pass data to FFmpeg. Credit to Philipp Sch http://www.codeproject.com/Tips/489450/Creating-Custom-FFmpeg-IO-Context
